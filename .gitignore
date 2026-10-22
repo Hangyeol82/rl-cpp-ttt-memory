@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Experiment outputs and checkpoints
+artifacts/
+runs/
+*.zip
+*.pt
+*.pth
+
+# OS/editor files
+.DS_Store
+.vscode/

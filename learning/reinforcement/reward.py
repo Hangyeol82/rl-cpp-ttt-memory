@@ -1,0 +1,237 @@
+from dataclasses import dataclass
+import math
+from typing import Dict, Optional
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class CPPRewardConfig:
+    """
+    Discrete-grid CPP reward template:
+    R = R_cell + R_TV^I + R_TV^G + R_coll + R_const
+
+    R_cell gives a fixed bonus when the executed move covers one previously
+    unvisited free cell. It is not area- or velocity-normalized.
+    """
+
+    new_cell_reward: float = 0.7
+
+    local_tv_reward_scale: float = 1.0
+    local_tv_reward_max: float = 5.0
+    local_tv_normalizer: float = 2.5
+    local_tv_new_cell_only: bool = True
+
+    global_tv_reward_scale: float = 0.0
+    global_tv_reward_max: float = 5.0
+    global_tv_normalizer: float = 4.0
+    # Short-horizon, POMDP-aware coverage-shape regularizer. The env computes
+    # the TV change over the union of recent local observation windows and adds
+    # it separately as reward_sg_tv.
+    semi_global_tv_reward_scale: float = 0.0
+    semi_global_tv_horizon: int = 32
+    # If positive, use this shorter horizon only for the min-new-cells gate.
+    # 0 preserves the legacy behavior: gate over semi_global_tv_horizon.
+    semi_global_tv_gate_horizon: int = 0
+    semi_global_tv_clip: float = 2.0
+    semi_global_tv_window_size: int = 41
+    semi_global_tv_min_new_cells: int = 1
+    # Legacy switch: apply attenuation on TV gradients across edges touching obstacles.
+    tv_exclude_obstacle_edges: bool = True
+    # Attenuation factor for obstacle-touching edges in TV.
+    # 0.0: fully ignore (previous behavior), 1.0: no attenuation.
+    tv_obstacle_edge_weight: float = 0.35
+
+    collision_reward: float = -10.0
+    constant_reward: float = -0.1
+    constant_reward_always: bool = True
+    # Discrete-grid shaping terms (applied in env step logic).
+    # - turn_change_penalty: applied whenever executed direction changes from previous step.
+    # - revisit_penalty: applied when stepping onto an already explored free cell.
+    turn_change_penalty: float = -0.05
+    revisit_penalty: float = -0.2
+    # Optional overlap-streak shaping:
+    # total overlap penalty magnitude grows from abs(revisit_penalty) by
+    # overlap_streak_increment after overlap_streak_grace repeated overlap steps,
+    # capped at overlap_streak_max_abs.
+    overlap_streak_enabled: bool = False
+    overlap_streak_grace: int = 2
+    overlap_streak_increment: float = 0.05
+    overlap_streak_max_abs: float = 0.4
+    # Coverage milestone shaping (applied in env step logic, once per episode).
+    # Bonus_i = milestone_lambda_i * (1 - milestone_threshold_i) * free_total * new_cell_reward
+    milestone_reward_enabled: bool = False
+    milestone_threshold_90: float = 0.90
+    milestone_threshold_99: float = 0.99
+    milestone_lambda_90: float = 0.2
+    milestone_lambda_99: float = 4.0
+
+
+@dataclass(frozen=True)
+class CPPRewardInput:
+    """
+    Required runtime signals for reward computation.
+    - newly_visited: 1 when the step covers a previously unvisited free cell, else 0
+    - local_tv_old/new: local TV before/after step
+    - global_tv: global TV after step
+    - coverage_pixels: number of covered free cells after step
+    - collided: whether the current step caused a collision
+    """
+
+    newly_visited: float
+    local_tv_old: float
+    local_tv_new: float
+    global_tv: float
+    coverage_pixels: float
+    collided: bool = False
+    collision_reward_override: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class CPPRewardBreakdown:
+    # Kept as `area`/`reward_area` for historical log compatibility.
+    area: float
+    tv_local: float
+    tv_global: float
+    collision: float
+    constant: float
+    total: float
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "reward_new_cell": float(self.area),
+            "reward_area": float(self.area),
+            "reward_tv_i": float(self.tv_local),
+            "reward_tv_g": float(self.tv_global),
+            "reward_coll": float(self.collision),
+            "reward_const": float(self.constant),
+            "reward_total": float(self.total),
+        }
+
+
+def _signed_clip(value: float, max_abs: float) -> float:
+    lim = max(0.0, float(max_abs))
+    if lim == 0.0:
+        return 0.0
+    v = float(value)
+    if v > lim:
+        return lim
+    if v < -lim:
+        return -lim
+    return v
+
+
+def compute_cpp_reward(inp: CPPRewardInput, cfg: CPPRewardConfig) -> CPPRewardBreakdown:
+    """
+    Compute reward terms:
+      R_cell + R_TV^I + R_TV^G + R_coll + R_const
+    """
+
+    newly_visited = max(0.0, float(inp.newly_visited))
+    collided = bool(inp.collided)
+
+    reward_cell = 0.0
+    reward_tv_i = 0.0
+    reward_tv_g = 0.0
+
+    if not collided:
+        reward_cell = float(cfg.new_cell_reward) if newly_visited > 0.0 else 0.0
+
+        if newly_visited > 0.0:
+            tv_diff = float(inp.local_tv_new) - float(inp.local_tv_old)
+            reward_tv_i = -tv_diff
+            reward_tv_i /= max(1e-8, float(cfg.local_tv_normalizer))
+            reward_tv_i *= float(cfg.local_tv_reward_scale)
+            reward_tv_i = _signed_clip(reward_tv_i, cfg.local_tv_reward_max)
+
+        coverage_pixels = max(1.0, float(inp.coverage_pixels))
+        reward_tv_g = -float(inp.global_tv)
+        reward_tv_g /= math.sqrt(coverage_pixels)
+        reward_tv_g /= max(1e-8, float(cfg.global_tv_normalizer))
+        reward_tv_g *= float(cfg.global_tv_reward_scale)
+        reward_tv_g = _signed_clip(reward_tv_g, cfg.global_tv_reward_max)
+
+    if collided:
+        reward_coll = (
+            float(inp.collision_reward_override)
+            if inp.collision_reward_override is not None
+            else float(cfg.collision_reward)
+        )
+    else:
+        reward_coll = 0.0
+    reward_const = (
+        float(cfg.constant_reward)
+        if cfg.constant_reward_always or newly_visited <= 0.0
+        else 0.0
+    )
+
+    total = reward_cell + reward_tv_i + reward_tv_g + reward_coll + reward_const
+    return CPPRewardBreakdown(
+        area=float(reward_cell),
+        tv_local=float(reward_tv_i),
+        tv_global=float(reward_tv_g),
+        collision=float(reward_coll),
+        constant=float(reward_const),
+        total=float(total),
+    )
+
+
+def total_variation(
+    img: np.ndarray,
+    img2: Optional[np.ndarray] = None,
+    mode: str = "sym-iso",
+    *,
+    obstacle_mask: Optional[np.ndarray] = None,
+    exclude_obstacle_edges: bool = False,
+    obstacle_edge_weight: float = 0.0,
+) -> float:
+    """
+    Compatible TV helper adapted from rl-cpp.
+    """
+
+    if mode not in {"sym-iso", "non-sym-iso", "non-iso"}:
+        raise ValueError(f"Unsupported TV mode: {mode}")
+
+    x = np.asarray(img, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D array for TV, got shape={x.shape}")
+
+    diff_v = np.abs(x[1:, :] - x[:-1, :])
+    diff_h = np.abs(x[:, 1:] - x[:, :-1])
+
+    if img2 is not None:
+        y = np.asarray(img2, dtype=np.float32)
+        if y.shape != x.shape:
+            raise ValueError(f"img2 must match img shape, got {y.shape} vs {x.shape}")
+        y = np.maximum(x, y)
+        diff_v = np.minimum(diff_v, np.abs(y[1:, :] - y[:-1, :]))
+        diff_h = np.minimum(diff_h, np.abs(y[:, 1:] - y[:, :-1]))
+
+    if exclude_obstacle_edges and obstacle_mask is not None:
+        obs = np.asarray(obstacle_mask, dtype=np.float32)
+        if obs.shape != x.shape:
+            raise ValueError(
+                f"obstacle_mask must match img shape, got {obs.shape} vs {x.shape}"
+            )
+        obs = obs > 0.5
+        touches_obs_v = obs[1:, :] | obs[:-1, :]
+        touches_obs_h = obs[:, 1:] | obs[:, :-1]
+        w = float(np.clip(float(obstacle_edge_weight), 0.0, 1.0))
+        # Keep a reduced penalty near obstacles instead of forcing it to zero.
+        diff_v = np.where(touches_obs_v, w * diff_v, diff_v)
+        diff_h = np.where(touches_obs_h, w * diff_h, diff_h)
+
+    if mode == "sym-iso":
+        tv = (
+            np.sum(np.sqrt(diff_v[:, 1:] ** 2 + diff_h[1:, :] ** 2))
+            + np.sum(np.sqrt(diff_v[:, 1:] ** 2 + diff_h[:-1, :] ** 2))
+            + np.sum(np.sqrt(diff_v[:, :-1] ** 2 + diff_h[:-1, :] ** 2))
+            + np.sum(np.sqrt(diff_v[:, :-1] ** 2 + diff_h[1:, :] ** 2))
+        )
+        return float(tv / 4.0)
+
+    if mode == "non-sym-iso":
+        tv = np.sum(np.sqrt(diff_v[:, :-1] ** 2 + diff_h[:-1, :] ** 2))
+        return float(tv)
+
+    return float(np.sum(diff_v) + np.sum(diff_h))
